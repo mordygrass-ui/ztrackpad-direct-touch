@@ -22,7 +22,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
       - name: Install matching official Android platform and build tools
         shell: bash
         run: |
