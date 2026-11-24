@@ -1,0 +1,197 @@
+# Temporary So7o direct-touch test build. This produces an APK, not the final Tasker helper.
+# To use: fork https://github.com/jan5o7o/ztrackpad, add this file under
+# .github/workflows/direct-touch-test.yml, then Actions > Build So7o Direct-Touch Test > Run workflow.
+name: Build So7o Direct-Touch Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out So7o source
+        uses: actions/checkout@v4
+
+      - name: Configure Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install matching official Android platform and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-36' 'build-tools;36.0.0'
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          test -s "$SDK_ROOT/platforms/android-36/android.jar"
+          mkdir -p sdk/platforms/android-36
+          cp "$SDK_ROOT/platforms/android-36/android.jar" sdk/platforms/android-36/android.jar
+          echo "$SDK_ROOT/build-tools/36.0.0" >> "$GITHUB_PATH"
+
+      - name: Apply direct-touch prototype patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Temporary So7o direct-touch prototype patch.
+          
+          Usage: python3 so7o_direct_touch_patch.py /path/to/ztrackpad
+          
+          Applies a deliberately minimal single-finger touch bridge to So7o's floating
+          virtual-display SurfaceView. The intent is to prove touchscreen forwarding on
+          the user's phone BEFORE writing the separate root-launched helper.
+          
+          Based on https://github.com/jan5o7o/ztrackpad (MIT license). Run only against
+          an inspected checkout. Does not install or execute an APK.
+          """
+          import sys
+          from pathlib import Path
+          
+          MARKER = 'FLOATING_DIRECT_TOUCH_POC_20261124'
+          
+          UI_ANCHOR = '        screenView = new SurfaceView(this);\n'
+          UI_REPLACEMENT = '''        screenView = new SurfaceView(this);
+                  // FLOATING_DIRECT_TOUCH_POC_20261124
+                  // TEMPORARY TEST: forward only one-finger gestures from the displayed app.
+                  // Keep the header/grips separate, so these still move and resize the window.
+                  screenView.setOnTouchListener(new View.OnTouchListener() {
+                      private boolean forwarding = false;
+          
+                      @Override public boolean onTouch(View view, MotionEvent e) {
+                          final int action = e.getActionMasked();
+                          if (action == MotionEvent.ACTION_DOWN) {
+                              forwarding = useShizuku() && ownVirtualDisplayId >= 0
+                                      && virtualDisplayHasSurface && screenSurfaceAlive;
+                          }
+                          // Consume the touch even while the virtual display is unavailable;
+                          // never allow it to fall through into another window.
+                          if (!forwarding) return true;
+                          if (view.getWidth() <= 0 || view.getHeight() <= 0
+                                  || screenSurfaceW <= 0 || screenSurfaceH <= 0) {
+                              forwarding = false;
+                              return true;
+                          }
+                          // For the first experiment, CANCEL the guest gesture if a second
+                          // finger arrives. Proper multi-pointer injection is a later step.
+                          final int forwardedAction;
+                          if (action == MotionEvent.ACTION_POINTER_DOWN) {
+                              forwardedAction = MotionEvent.ACTION_CANCEL;
+                          } else if (action == MotionEvent.ACTION_DOWN
+                                  || action == MotionEvent.ACTION_MOVE
+                                  || action == MotionEvent.ACTION_UP
+                                  || action == MotionEvent.ACTION_CANCEL) {
+                              forwardedAction = action;
+                          } else {
+                              return true;
+                          }
+                          final float x = Math.max(0f, Math.min(screenSurfaceW - 1f,
+                                  e.getX(0) * ((float) screenSurfaceW / view.getWidth())));
+                          final float y = Math.max(0f, Math.min(screenSurfaceH - 1f,
+                                  e.getY(0) * ((float) screenSurfaceH / view.getHeight())));
+                          final int id = ownVirtualDisplayId;
+                          shizuku.touchOnDisplay(id, forwardedAction, x, y, e.getDownTime());
+                          if (forwardedAction == MotionEvent.ACTION_DOWN) {
+                              Log.i(TAG, "direct touch DOWN display=" + id
+                                      + " pos=" + (int) x + "," + (int) y);
+                          }
+                          if (forwardedAction == MotionEvent.ACTION_UP
+                                  || forwardedAction == MotionEvent.ACTION_CANCEL) {
+                              forwarding = false;
+                              Log.i(TAG, "direct touch END display=" + id
+                                      + " action=" + forwardedAction);
+                          }
+                          return true;
+                      }
+                  });
+          '''
+          
+          BRIDGE_ANCHOR = '    /** Touch-style long press: DOWN now, UP after ms (non-blocking). */\n'
+          BRIDGE_REPLACEMENT = '''    // FLOATING_DIRECT_TOUCH_POC_20261124
+              /** Inject a finger event into a specified virtual display without retargeting
+               * the existing trackpad. Binder transactions preserve event order. */
+              public void touchOnDisplay(int id, int action, float x, float y, long downTime) {
+                  if (!isReady() || id < 0) return;
+                  try {
+                      shell.injectMouse(action, x, y, id,
+                              InputDevice.SOURCE_TOUCHSCREEN, 0, downTime);
+                  } catch (Throwable t) {
+                      Log.w(TAG, "touchOnDisplay: " + t);
+                  }
+              }
+          
+              /** Touch-style long press: DOWN now, UP after ms (non-blocking). */
+          '''
+          
+          
+          def main():
+              if len(sys.argv) != 2:
+                  print('Usage: python3 so7o_direct_touch_patch.py /path/to/ztrackpad')
+                  return 2
+              repo = Path(sys.argv[1]).expanduser()
+              base = repo / 'java/app/so7o/ztrackpad'
+              actions = [
+                  (base / 'TrackpadService.java', UI_ANCHOR, UI_REPLACEMENT),
+                  (base / 'ShizukuInputHandler.java', BRIDGE_ANCHOR, BRIDGE_REPLACEMENT),
+              ]
+              new_contents = []
+              # Validate both files before modifying either.
+              for path, anchor, replacement in actions:
+                  if not path.is_file():
+                      print('ERROR: missing file:', path)
+                      return 1
+                  original = path.read_text(encoding='utf-8')
+                  if MARKER in original:
+                      print('ERROR: already patched:', path)
+                      return 1
+                  if original.count(anchor) != 1:
+                      print('ERROR: expected exactly one insertion point in', path,
+                            'but found', original.count(anchor))
+                      return 1
+                  new_contents.append((path, original, original.replace(anchor, replacement, 1)))
+              for path, old, new in new_contents:
+                  bak = path.with_name(path.name + '.before-direct-touch')
+                  if bak.exists():
+                      print('ERROR: refusing to overwrite existing backup:', bak)
+                      return 1
+              for path, old, new in new_contents:
+                  path.with_name(path.name + '.before-direct-touch').write_text(old, encoding='utf-8')
+                  path.write_text(new, encoding='utf-8')
+                  print('Patched:', path)
+              print('Done. Source patched only; no build/install has been performed.')
+              print('The prototype is single-finger only, and uses the existing Shizuku service.')
+              return 0
+          
+          
+          if __name__ == '__main__':
+              sys.argv = [sys.argv[0], '.']
+              raise SystemExit(main())
+          PY
+
+      - name: Build and sign temporary test APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in aapt2 aidl javac d8 apksigner python3 keytool; do
+            command -v "$tool" || exit 1
+          done
+          export KSPASS="$(openssl rand -hex 24)"
+          bash ./build.sh
+          test -s out/ztrackpad.apk
+          apksigner verify out/ztrackpad.apk
+          unzip -t out/ztrackpad.apk | tail -n 1
+          cp out/ztrackpad.apk So7o-DirectTouch-Test.apk
+
+      - name: Downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: So7o-DirectTouch-Test-APK
+          path: So7o-DirectTouch-Test.apk
+          if-no-files-found: error
+          retention-days: 7
